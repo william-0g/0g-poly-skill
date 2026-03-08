@@ -2,34 +2,38 @@
 """
 Polymarket FastLoop Trader
 
-Trades Polymarket BTC 5-minute and 15-minute fast markets using CEX price momentum.
-Default signal: Binance BTCUSDT candles. Agents can customize signal source.
+Evaluates Polymarket BTC 5-minute and 15-minute fast markets using CEX price momentum.
+Default signal: Binance BTCUSDT candles. Qualifying signals can be recorded to SQLite
+for paper trading; real-money execution is intentionally disabled.
 
 Usage:
-    python fastloop_trader.py              # Dry run (show opportunities, no trades)
-    python fastloop_trader.py --live       # Execute real trades
-    python fastloop_trader.py --positions  # Show current fast market positions
-    python fastloop_trader.py --quiet      # Only output on trades/errors
+    python fastloop_trader.py                 # Dry run (show opportunities, no trades)
+    python fastloop_trader.py --record-paper  # Record a paper trade when signal qualifies
+    python fastloop_trader.py --positions     # Show current live Polymarket fast positions
+    python fastloop_trader.py --paper-positions  # Show current paper positions
+    python fastloop_trader.py --live          # Execute a live trade when signal qualifies
+    python fastloop_trader.py --quiet         # Only output on trades/errors
 
 Requires:
-    POLYMARKET_PRIVATE_KEY environment variable (your Polygon wallet private key)
-    pip install py-clob-client
+    SQLite (bundled with Python) for paper journaling
+    POLYMARKET_PRIVATE_KEY for live trading and live position checks
 """
 
 import os
 import sys
 import json
-import math
+import sqlite3
 import argparse
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
+from pathlib import Path
 from urllib.request import urlopen, Request
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode, quote
+from zoneinfo import ZoneInfo
 
 # Force line-buffered stdout for non-TTY environments (cron, Docker, OpenClaw)
 sys.stdout.reconfigure(line_buffering=True)
 
-# py-clob-client imports (deferred to avoid import error when just showing --config)
+# py-clob-client imports (deferred so dry-run/config still work without package)
 _clob_imports_ready = False
 ClobClient = None
 MarketOrderArgs = None
@@ -41,7 +45,7 @@ Account = None
 
 
 def _ensure_clob_imports():
-    """Lazy-import py-clob-client so --config/--help work without the package."""
+    """Lazy-import py-clob-client so dry-run and config remain lightweight."""
     global _clob_imports_ready, ClobClient, MarketOrderArgs, OrderType, POLYGON, BUY, SELL, Account
     if _clob_imports_ready:
         return
@@ -61,9 +65,8 @@ def _ensure_clob_imports():
         _clob_imports_ready = True
     except ImportError:
         print("Error: py-clob-client not installed.")
-        print("Run: pip install py-clob-client")
+        print("Run: uv sync")
         sys.exit(1)
-
 
 # Optional: Trade Journal integration
 try:
@@ -101,13 +104,15 @@ CONFIG_SCHEMA = {
                "help": "Market window duration (5m or 15m)"},
     "volume_confidence": {"default": True, "env": "PM_FASTLOOP_VOL_CONF", "type": bool,
                           "help": "Weight signal by volume (higher volume = more confident)"},
+    "paper_trade_db": {"default": "fastloop_paper.db", "env": "PM_FASTLOOP_DB", "type": str,
+                       "help": "SQLite database path for recorded paper trades"},
 }
 
 TRADE_SOURCE = "clob:fastloop"
 SMART_SIZING_PCT = 0.05  # 5% of balance per trade
 MIN_SHARES_PER_ORDER = 5  # Polymarket minimum
-
-# API endpoints
+DEFAULT_PAPER_CASH = 100.0
+NEW_YORK_TZ = ZoneInfo("America/New_York")
 CLOB_HOST = "https://clob.polymarket.com"
 DATA_API = "https://data-api.polymarket.com"
 
@@ -126,10 +131,21 @@ ASSET_PATTERNS = {
 }
 
 
+def _resolve_config_path(skill_file, config_filename="config.json"):
+    skill_path = Path(skill_file).resolve()
+    candidate_paths = [
+        skill_path.parents[1] / config_filename,
+        skill_path.parent / config_filename,
+    ]
+    for path in candidate_paths:
+        if path.exists():
+            return path
+    return candidate_paths[0]
+
+
 def _load_config(schema, skill_file, config_filename="config.json"):
     """Load config with priority: config.json > env vars > defaults."""
-    from pathlib import Path
-    config_path = Path(skill_file).parent / config_filename
+    config_path = _resolve_config_path(skill_file, config_filename)
     file_cfg = {}
     if config_path.exists():
         try:
@@ -157,14 +173,13 @@ def _load_config(schema, skill_file, config_filename="config.json"):
 
 
 def _get_config_path(skill_file, config_filename="config.json"):
-    from pathlib import Path
-    return Path(skill_file).parent / config_filename
+    return _resolve_config_path(skill_file, config_filename)
 
 
 def _update_config(updates, skill_file, config_filename="config.json"):
     """Update config.json with new values."""
-    from pathlib import Path
-    config_path = Path(skill_file).parent / config_filename
+    config_path = _resolve_config_path(skill_file, config_filename)
+    config_path.parent.mkdir(parents=True, exist_ok=True)
     existing = {}
     if config_path.exists():
         try:
@@ -189,6 +204,7 @@ MIN_TIME_REMAINING = cfg["min_time_remaining"]
 ASSET = cfg["asset"].upper()
 WINDOW = cfg["window"]  # "5m" or "15m"
 VOLUME_CONFIDENCE = cfg["volume_confidence"]
+PAPER_TRADE_DB = cfg["paper_trade_db"]
 
 
 # =============================================================================
@@ -218,7 +234,6 @@ def get_wallet_address():
     _ensure_clob_imports()
     pk = get_private_key()
     return Account.from_key(pk).address
-
 
 def _api_request(url, method="GET", data=None, headers=None, timeout=15):
     """Make an HTTP request. Returns parsed JSON or None on error."""
@@ -302,13 +317,15 @@ def _parse_fast_market_end_time(question):
     try:
         date_str = match.group(1)
         time_str = match.group(2)
-        year = datetime.now(timezone.utc).year
+        year = datetime.now(NEW_YORK_TZ).year
         dt_str = f"{date_str} {year} {time_str}"
-        # Parse as ET (UTC-5)
-        dt = datetime.strptime(dt_str, "%B %d %Y %I:%M%p")
-        # Convert ET to UTC (+5 hours)
-        dt = dt.replace(tzinfo=timezone.utc) + timedelta(hours=5)
-        return dt
+        dt_local = datetime.strptime(dt_str, "%B %d %Y %I:%M%p").replace(tzinfo=NEW_YORK_TZ)
+
+        now_local = datetime.now(NEW_YORK_TZ)
+        if dt_local < now_local and (now_local - dt_local).days > 300:
+            dt_local = dt_local.replace(year=dt_local.year + 1)
+
+        return dt_local.astimezone(timezone.utc)
     except Exception:
         return None
 
@@ -424,7 +441,7 @@ def get_momentum(asset="BTC", source="binance", lookback=5):
 # Polymarket CLOB Trading
 # =============================================================================
 
-def get_positions(address):
+def get_live_positions(address):
     """Get current positions from Polymarket Data API."""
     url = f"{DATA_API}/positions?user={address}&sizeThreshold=0.1&limit=100"
     result = _api_request(url)
@@ -435,22 +452,13 @@ def get_positions(address):
     return []
 
 
-def get_portfolio(address):
+def get_live_portfolio(address):
     """Get portfolio value from Polymarket Data API."""
     return _api_request(f"{DATA_API}/value?user={address}")
 
 
-def execute_trade(client, token_id, amount):
-    """Execute a FOK market order on Polymarket via CLOB.
-
-    Args:
-        client: Authenticated ClobClient instance.
-        token_id: CLOB token ID for the outcome to buy.
-        amount: USD amount to trade.
-
-    Returns:
-        dict with order result or error info.
-    """
+def execute_live_trade(client, token_id, amount):
+    """Execute a FOK market order on Polymarket via CLOB."""
     try:
         order_args = MarketOrderArgs(
             token_id=token_id,
@@ -463,32 +471,192 @@ def execute_trade(client, token_id, amount):
     except Exception as e:
         return {"error": str(e)}
 
+def _db_path():
+    path = Path(PAPER_TRADE_DB)
+    if not path.is_absolute():
+        path = Path(__file__).resolve().parents[1] / path
+    return path
 
-def calculate_position_size(address, max_size, smart_sizing=False):
-    """Calculate position size, optionally based on portfolio."""
+
+def ensure_paper_db():
+    """Create the SQLite schema if it does not exist yet."""
+    db_path = _db_path()
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS fastloop_trades (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              market_id TEXT NOT NULL,
+              market_name TEXT NOT NULL,
+              strategy TEXT NOT NULL,
+              direction TEXT NOT NULL,
+              entry_price REAL NOT NULL,
+              exit_price REAL,
+              quantity REAL NOT NULL,
+              pnl REAL,
+              signal_momentum_pct REAL,
+              volume_ratio REAL,
+              status TEXT NOT NULL DEFAULT 'OPEN',
+              created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              closed_at TEXT,
+              UNIQUE(market_id, direction, status)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS portfolio (
+              id INTEGER PRIMARY KEY CHECK (id = 1),
+              total_value REAL NOT NULL,
+              cash REAL NOT NULL,
+              positions TEXT NOT NULL,
+              updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO portfolio (id, total_value, cash, positions)
+            VALUES (1, ?, ?, '[]')
+            ON CONFLICT(id) DO NOTHING
+            """,
+            (DEFAULT_PAPER_CASH, DEFAULT_PAPER_CASH),
+        )
+
+
+def get_paper_portfolio():
+    ensure_paper_db()
+    with sqlite3.connect(_db_path()) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT total_value, cash, positions, updated_at FROM portfolio WHERE id = 1").fetchone()
+    if row is None:
+        return {
+            "total_value": DEFAULT_PAPER_CASH,
+            "cash": DEFAULT_PAPER_CASH,
+            "positions": [],
+            "updated_at": None,
+        }
+    return {
+        "total_value": float(row["total_value"]),
+        "cash": float(row["cash"]),
+        "positions": json.loads(row["positions"] or "[]"),
+        "updated_at": row["updated_at"],
+    }
+
+
+def get_positions():
+    """Return open paper positions from SQLite."""
+    ensure_paper_db()
+    with sqlite3.connect(_db_path()) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            SELECT market_id, market_name, direction, entry_price, quantity, signal_momentum_pct,
+                   volume_ratio, created_at
+            FROM fastloop_trades
+            WHERE status = 'OPEN'
+            ORDER BY created_at DESC
+            """
+        ).fetchall()
+    return rows
+
+
+def calculate_position_size(max_size, smart_sizing=False, live_mode=False, address=None):
+    """Calculate position size for either live or paper mode."""
     if not smart_sizing:
         return max_size
-    portfolio = get_portfolio(address)
-    if not portfolio or isinstance(portfolio, dict) and portfolio.get("error"):
-        return max_size
-    # Data API /value returns portfolio value
-    balance = 0
-    if isinstance(portfolio, dict):
-        balance = float(portfolio.get("value", 0) or 0)
-    elif isinstance(portfolio, (int, float)):
-        balance = float(portfolio)
+    if live_mode:
+        portfolio = get_live_portfolio(address)
+        if not portfolio or isinstance(portfolio, dict) and portfolio.get("error"):
+            return max_size
+        if isinstance(portfolio, dict):
+            balance = float(portfolio.get("value", 0) or 0)
+        else:
+            balance = float(portfolio)
+    else:
+        portfolio = get_paper_portfolio()
+        balance = float(portfolio.get("cash", 0) or 0)
     if balance <= 0:
-        return max_size
+        return 0.0
     smart_size = balance * SMART_SIZING_PCT
     return min(smart_size, max_size)
+
+
+def record_paper_trade(market, direction, entry_price, quantity, momentum_pct, volume_ratio):
+    """Persist a paper trade candidate and refresh the lightweight portfolio snapshot."""
+    ensure_paper_db()
+    db_path = _db_path()
+    position_cost = entry_price * quantity
+
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        existing_open = conn.execute(
+            """
+            SELECT id FROM fastloop_trades
+            WHERE market_id = ? AND direction = ? AND status = 'OPEN'
+            """,
+            (market["condition_id"], direction),
+        ).fetchone()
+        if existing_open is not None:
+            return False, "Paper trade already recorded for this market and direction"
+
+        portfolio_row = conn.execute(
+            "SELECT cash, positions FROM portfolio WHERE id = 1"
+        ).fetchone()
+        cash = float(portfolio_row["cash"])
+        if position_cost > cash + 1e-9:
+            return False, f"Insufficient paper cash (${cash:.2f} available)"
+
+        positions = json.loads(portfolio_row["positions"] or "[]")
+        positions.append(
+            {
+                "market_id": market["condition_id"],
+                "market_name": market["question"],
+                "direction": direction,
+                "entry_price": round(entry_price, 4),
+                "quantity": round(quantity, 4),
+                "recorded_at": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+
+        conn.execute(
+            """
+            INSERT INTO fastloop_trades (
+              market_id, market_name, strategy, direction, entry_price, quantity,
+              signal_momentum_pct, volume_ratio
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                market["condition_id"],
+                market["question"],
+                TRADE_SOURCE,
+                direction,
+                entry_price,
+                quantity,
+                momentum_pct,
+                volume_ratio,
+            ),
+        )
+        updated_cash = cash - position_cost
+        total_value = updated_cash + sum(p["entry_price"] * p["quantity"] for p in positions)
+        conn.execute(
+            """
+            UPDATE portfolio
+            SET cash = ?, total_value = ?, positions = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE id = 1
+            """,
+            (updated_cash, total_value, json.dumps(positions)),
+        )
+    return True, None
 
 
 # =============================================================================
 # Main Strategy Logic
 # =============================================================================
 
-def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=False,
-                        smart_sizing=False, quiet=False):
+def run_fast_market_strategy(dry_run=True, positions_only=False, paper_positions_only=False, show_config=False,
+                        smart_sizing=False, quiet=False, record_paper=False):
     """Run one cycle of the fast_market trading strategy."""
 
     def log(msg, force=False):
@@ -499,8 +667,14 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
     log("⚡ Polymarket FastLoop Trader")
     log("=" * 50)
 
-    if dry_run:
-        log("\n  [DRY RUN] No trades will be executed. Use --live to enable trading.")
+    live_mode = not dry_run and not record_paper
+
+    if dry_run and not record_paper:
+        log("\n  [DRY RUN] No trades will be recorded. Use --record-paper to persist paper trades.")
+    elif record_paper:
+        log("\n  [PAPER MODE] Qualifying signals will be recorded to SQLite.")
+    else:
+        log("\n  [LIVE MODE] Qualifying signals will place real Polymarket orders.", force=True)
 
     log(f"\n⚙️  Configuration:")
     log(f"  Asset:            {ASSET}")
@@ -516,42 +690,66 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
     if show_config:
         config_path = _get_config_path(__file__)
         log(f"\n  Config file: {config_path}")
+        log(f"  Paper DB:    {_db_path()}")
         log(f"\n  To change settings:")
         log(f'    python fastloop_trader.py --set entry_threshold=0.08')
         log(f'    python fastloop_trader.py --set asset=ETH')
         log(f'    Or edit config.json directly')
         return
 
-    # Initialize CLOB client and wallet address
-    _ensure_clob_imports()
-    address = get_wallet_address()
-    # Only create the full CLOB client when we need to trade
-    client = None
-
     # Show positions if requested
     if positions_only:
-        log("\n📊 Sprint Positions:")
-        positions = get_positions(address)
+        _ensure_clob_imports()
+        address = get_wallet_address()
+        log("\n📊 Live Sprint Positions:")
+        positions = get_live_positions(address)
         fast_market_positions = [p for p in positions if "up or down" in (p.get("title", "") or p.get("question", "") or "").lower()]
         if not fast_market_positions:
-            log("  No open fast market positions")
+            log("  No open live fast market positions")
         else:
             for pos in fast_market_positions:
                 title = pos.get("title", "") or pos.get("question", "Unknown")
-                log(f"  • {title[:60]}")
-                size = pos.get("size", 0)
+                size = float(pos.get("size", 0) or 0)
                 outcome = pos.get("outcome", "?")
-                pnl = pos.get("cashPnl", 0) or pos.get("pnl", 0)
-                log(f"    {outcome}: {float(size):.1f} shares | P&L: ${float(pnl):.2f}")
+                pnl = float(pos.get("cashPnl", 0) or pos.get("pnl", 0) or 0)
+                log(f"  • {title[:60]}")
+                log(f"    {outcome}: {size:.1f} shares | P&L: ${pnl:.2f}")
+        return
+
+    if paper_positions_only:
+        ensure_paper_db()
+        log("\n📊 Paper Positions:")
+        positions = get_positions()
+        if not positions:
+            log("  No open paper positions")
+        else:
+            for pos in positions:
+                log(f"  • {pos['market_name'][:60]}")
+                log(
+                    f"    {pos['direction'].upper()}: {float(pos['quantity']):.1f} shares"
+                    f" @ ${float(pos['entry_price']):.3f}"
+                )
+        portfolio = get_paper_portfolio()
+        log(f"\n💰 Paper Portfolio:")
+        log(f"  Total value: ${portfolio['total_value']:.2f}")
+        log(f"  Cash:        ${portfolio['cash']:.2f}")
         return
 
     # Show portfolio if smart sizing
     if smart_sizing:
-        log("\n💰 Portfolio:")
-        portfolio = get_portfolio(address)
-        if portfolio and not (isinstance(portfolio, dict) and portfolio.get("error")):
-            value = portfolio.get("value", 0) if isinstance(portfolio, dict) else portfolio
-            log(f"  Value: ${float(value):.2f}")
+        if live_mode:
+            address = get_wallet_address()
+            log("\n💰 Live Portfolio:")
+            portfolio = get_live_portfolio(address)
+            if portfolio and not (isinstance(portfolio, dict) and portfolio.get("error")):
+                value = portfolio.get("value", 0) if isinstance(portfolio, dict) else portfolio
+                log(f"  Value:       ${float(value):.2f}")
+        else:
+            ensure_paper_db()
+            log("\n💰 Paper Portfolio:")
+            portfolio = get_paper_portfolio()
+            log(f"  Total value: ${portfolio['total_value']:.2f}")
+            log(f"  Cash:        ${portfolio['cash']:.2f}")
 
     # Step 1: Discover fast markets
     log(f"\n🔍 Discovering {ASSET} fast markets...")
@@ -672,7 +870,10 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
             return
 
     # We have a signal!
-    position_size = calculate_position_size(address, MAX_POSITION_USD, smart_sizing)
+    address = get_wallet_address() if live_mode and smart_sizing else None
+    if record_paper:
+        ensure_paper_db()
+    position_size = calculate_position_size(MAX_POSITION_USD, smart_sizing, live_mode=live_mode, address=address)
     price = market_yes_price if side == "yes" else (1 - market_yes_price)
 
     # Check minimum order size
@@ -681,32 +882,56 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
         if min_cost > position_size:
             log(f"  ⚠️  Position ${position_size:.2f} too small for {MIN_SHARES_PER_ORDER} shares at ${price:.2f}")
             return
+    if position_size <= 0:
+        if live_mode:
+            log("  ⏸️  No live portfolio value available for a new trade")
+        else:
+            log("  ⏸️  No paper cash available for a new trade")
+        return
 
     log(f"  ✅ Signal: {side.upper()} — {trade_rationale}{vol_note}", force=True)
     log(f"  Divergence: {divergence:.3f}", force=True)
+    est_shares = position_size / price if price > 0 else 0
 
-    # Step 5: Trade via CLOB
-    if dry_run:
-        est_shares = position_size / price if price > 0 else 0
+    # Step 5: Trade or record
+    recorded = False
+    result = None
+    if dry_run and not record_paper:
         log(f"  [DRY RUN] Would buy {side.upper()} ${position_size:.2f} (~{est_shares:.1f} shares)", force=True)
-        log(f"  Token ID: {token_id[:20]}...", force=True)
+    elif record_paper:
+        recorded, error = record_paper_trade(
+            best,
+            side,
+            price,
+            est_shares,
+            momentum["momentum_pct"],
+            momentum["volume_ratio"],
+        )
+        if recorded:
+            log(f"  📝 Paper trade recorded: {side.upper()} ${position_size:.2f} (~{est_shares:.1f} shares)", force=True)
+            if JOURNAL_AVAILABLE:
+                confidence = min(0.9, 0.5 + divergence + (momentum_pct / 100))
+                log_trade(
+                    trade_id=f"paper:{best['condition_id']}:{side}",
+                    source=f"{TRADE_SOURCE}:paper",
+                    thesis=trade_rationale,
+                    confidence=round(confidence, 2),
+                    asset=ASSET,
+                    momentum_pct=round(momentum["momentum_pct"], 3),
+                    volume_ratio=round(momentum["volume_ratio"], 2),
+                    signal_source=SIGNAL_SOURCE,
+                )
+        else:
+            log(f"  ❌ Paper trade not recorded: {error}", force=True)
     else:
-        # Initialize CLOB client for trading
         client = get_clob_client()
-
         log(f"  Executing {side.upper()} trade for ${position_size:.2f} via CLOB...", force=True)
-        result = execute_trade(client, token_id, position_size)
-
+        result = execute_live_trade(client, token_id, position_size)
         if result and not (isinstance(result, dict) and result.get("error")):
-            # py-clob-client returns order info on success
-            order_id = None
-            if isinstance(result, dict):
-                order_id = result.get("orderID") or result.get("id")
+            order_id = result.get("orderID") or result.get("id") if isinstance(result, dict) else None
             log(f"  ✅ Order placed: {side.upper()} ${position_size:.2f}", force=True)
             if order_id:
                 log(f"  Order ID: {order_id}", force=True)
-
-            # Log to trade journal
             if JOURNAL_AVAILABLE:
                 confidence = min(0.9, 0.5 + divergence + (momentum_pct / 100))
                 log_trade(
@@ -724,28 +949,41 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
             log(f"  ❌ Trade failed: {error}", force=True)
 
     # Summary
-    total_trades = 0 if dry_run else (1 if result and not (isinstance(result, dict) and result.get("error")) else 0)
+    if dry_run and not record_paper:
+        total_trades = 0
+    elif record_paper:
+        total_trades = 1 if recorded else 0
+    else:
+        total_trades = 1 if result and not (isinstance(result, dict) and result.get("error")) else 0
     show_summary = not quiet or total_trades > 0
     if show_summary:
         print(f"\n📊 Summary:")
         print(f"  Sprint: {best['question'][:50]}")
         print(f"  Signal: {direction} {momentum_pct:.3f}% | YES ${market_yes_price:.3f}")
-        print(f"  Action: {'DRY RUN' if dry_run else ('TRADED' if total_trades else 'FAILED')}")
+        action = "DRY RUN"
+        if record_paper:
+            action = "PAPER RECORDED" if total_trades else "PAPER SKIPPED"
+        elif live_mode:
+            action = "TRADED" if total_trades else "FAILED"
+        print(f"  Action: {action}")
 
 
 # =============================================================================
 # CLI Entry Point
 # =============================================================================
 
-if __name__ == "__main__":
+def main():
     parser = argparse.ArgumentParser(description="Polymarket FastLoop Trader")
-    parser.add_argument("--live", action="store_true", help="Execute real trades (default is dry-run)")
+    parser.add_argument("--live", action="store_true", help="Execute real trades")
     parser.add_argument("--dry-run", action="store_true", help="(Default) Show opportunities without trading")
-    parser.add_argument("--positions", action="store_true", help="Show current fast market positions")
+    parser.add_argument("--positions", action="store_true", help="Show current live fast market positions")
+    parser.add_argument("--paper-positions", action="store_true", help="Show current paper positions")
     parser.add_argument("--config", action="store_true", help="Show current config")
     parser.add_argument("--set", action="append", metavar="KEY=VALUE",
                         help="Update config (e.g., --set entry_threshold=0.08)")
     parser.add_argument("--smart-sizing", action="store_true", help="Use portfolio-based position sizing")
+    parser.add_argument("--record-paper", action="store_true",
+                        help="Record qualifying signals to the SQLite paper-trading journal")
     parser.add_argument("--quiet", "-q", action="store_true",
                         help="Only output on trades/errors (ideal for high-frequency runs)")
     args = parser.parse_args()
@@ -780,7 +1018,13 @@ if __name__ == "__main__":
     run_fast_market_strategy(
         dry_run=dry_run,
         positions_only=args.positions,
+        paper_positions_only=args.paper_positions,
         show_config=args.config,
         smart_sizing=args.smart_sizing,
+        record_paper=args.record_paper,
         quiet=args.quiet,
     )
+
+
+if __name__ == "__main__":
+    main()

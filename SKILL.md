@@ -1,11 +1,11 @@
 ---
 name: polymarket-fast-loop
-description: Trade Polymarket BTC 5-minute and 15-minute fast markets using CEX price momentum signals via the official Polymarket CLOB client. Default signal is Binance BTC/USDT klines. Use when user wants to trade sprint/fast markets, automate short-term crypto trading, or use CEX momentum as a Polymarket signal.
+description: Trade Polymarket BTC 5-minute and 15-minute fast markets using CEX price momentum signals, with support for dry-run, paper journaling, and live execution through the official CLOB client. Default signal is Binance BTC/USDT klines.
 metadata:
   {
     "openclaw":
       {
-        "requires": { "bins": ["uv"], "env": ["POLYMARKET_PRIVATE_KEY"], "config": ["browser.enabled"] },
+        "requires": { "bins": ["uv"], "env": ["POLYMARKET_PRIVATE_KEY"] },
         "primaryEnv": "POLYMARKET_PRIVATE_KEY",
       },
   }
@@ -13,251 +13,227 @@ metadata:
 
 # Polymarket FastLoop Trader
 
-Trade Polymarket's 5-minute BTC fast markets using real-time price momentum from Binance.
+Evaluate or trade Polymarket fast markets with a simple momentum signal.
 
-> **Polymarket only.** All trades execute on Polymarket via the official CLOB client with real USDC. Use `--live` for real trades, dry-run is the default.
-
-**How it works:** Every cycle, the script finds the current live BTC fast market, checks BTC price momentum on Binance, and trades if momentum diverges from market odds.
-
-**This is a template.** The default signal (Binance momentum) gets you started. Your agent's reasoning is the edge — layer on sentiment analysis, multi-exchange spreads, news feeds, or custom signals to improve it.
-
-> ⚠️ Fast markets carry Polymarket's 10% fee (`is_paid: true`). Factor this into your edge calculations.
+> **Modes:** dry-run for inspection, `--record-paper` for SQLite paper journaling, and `--live` for real trades on Polymarket.
 
 ## When to Use This Skill
 
 Use this skill when the user wants to:
-- Trade BTC sprint/fast markets (5-minute or 15-minute)
-- Automate short-term crypto prediction trading
-- Use CEX price momentum as a Polymarket signal
-- Monitor sprint market positions
+- Trade or paper trade BTC/ETH/SOL fast markets
+- Monitor short-term crypto momentum against Polymarket odds
+- Keep a local SQLite journal of paper entries
+- Run the strategy on a cron/heartbeat loop
 
 ## Setup Flow
 
-When user asks to install or configure this skill:
+1. Ensure `uv` is installed, then run:
+   ```bash
+   uv sync
+   ```
+2. Confirm or adjust settings:
+   - `asset`: BTC, ETH, or SOL
+   - `window`: `5m` or `15m`
+   - `entry_threshold`: minimum divergence to act
+   - `max_position`: paper size cap per entry
+3. Choose the mode:
+   - Dry run: inspect the current opportunity only
+   - `--record-paper`: write a paper trade to SQLite when a signal qualifies
+   - `--live`: place a real order through the Polymarket CLOB client
+4. If the user wants automation, schedule the command with cron or heartbeat.
 
-1. **Install dependencies**
-  Make sure uv is installed, run uv --version to verify. If not, following the instructions:
-  #### **Direct Installation**
-    Choose the command for your operating system:
+Live mode requires `POLYMARKET_PRIVATE_KEY`.
 
-    **macOS / Linux:**
-    ```bash
-    curl -LsSf [https://astral.sh/uv/install.sh](https://astral.sh/uv/install.sh) | sh
-    ```
+## OpenClaw Invocation Rules
 
-    **Windows (PowerShell):**
-    ```powershell
-    powershell -ExecutionPolicy ByPass -c "irm [https://astral.sh/uv/install.ps1](https://astral.sh/uv/install.ps1) | iex"
-    ```
+When OpenClaw calls this skill from a prompt, map the requested mode directly to the CLI command:
 
-    [!TIP]
-    After installation, restart your terminal to ensure uv is in your PATH. Run uv --version to verify.
-
-  #### **Alternative (Via Pip)**
-  If you already have Python installed and prefer pip:
+- If the prompt says `dry-run`, run:
   ```bash
-  pip install uv
+  uv run python scripts/fastloop_trader.py
   ```
-
-  Once uv is installed, use the following commands to set up the environment:
-
+- If the prompt says `paper trading`, `paper-trading`, or `paper`, run:
   ```bash
-  uv sync
+  uv run python scripts/fastloop_trader.py --record-paper
   ```
+- If the prompt says `live`, run:
+  ```bash
+  uv run python scripts/fastloop_trader.py --live
+  ```
+- If the prompt does not specify a mode, default to `dry-run`.
 
-2. **Set your Polygon wallet private key**
-   - Must be a funded Polygon wallet with USDC.e
-   - Store in environment as `POLYMARKET_PRIVATE_KEY`
-   - Ensure token approvals are set for Polymarket exchange contracts
+Apply any requested configuration before running the command:
 
-3. **Ask about settings** (or confirm defaults)
-   - Asset: BTC, ETH, or SOL (default BTC)
-   - Entry threshold: Min divergence to trade (default 5¢)
-   - Max position: Amount per trade (default $5.00)
-   - Window: 5m or 15m (default 5m)
+- Asset: `--set asset=BTC|ETH|SOL`
+- Window: `--set window=5m|15m`
+- Max position: `--set max_position=<amount>`
+- Entry threshold: `--set entry_threshold=<amount>`
+- Lookback: `--set lookback_minutes=<minutes>`
 
-4. **Set up cron or loop** (user drives scheduling — see "How to Run on a Loop")
+For timed or recurring OpenClaw calls, the prompt should explicitly include the mode. Good examples:
 
-Ensure the environment variable POLYMARKET_PRIVATE_KEY is exported before running.
+- `Run polymarket-fast-loop in dry-run mode for BTC 15m`
+- `Run polymarket-fast-loop in paper trading mode for BTC 15m with max position 5`
+- `Run polymarket-fast-loop in live mode for BTC 15m with max position 5`
+
+Before running in `live` mode:
+
+- Confirm `POLYMARKET_PRIVATE_KEY` is available
+- Prefer a dry-run first if the user did not explicitly ask to skip it
+- Do not silently downgrade `live` to paper mode; surface the missing prerequisite instead
+
+## Recommended Prompt Templates
+
+Use prompts in this shape for OpenClaw heartbeat, cron wrappers, or recurring automations.
+
+Dry-run template:
+
+```text
+Run polymarket-fast-loop in dry-run mode.
+Set asset to BTC.
+Set window to 15m.
+Set max position to 5.
+Report the selected market, signal direction, divergence, and whether a trade would be taken.
+```
+
+Paper trading template:
+
+```text
+Run polymarket-fast-loop in paper trading mode.
+Set asset to BTC.
+Set window to 15m.
+Set max position to 5.
+If a qualifying signal exists, record it to the paper trading database.
+Report whether a paper trade was recorded.
+```
+
+Live template:
+
+```text
+Run polymarket-fast-loop in live mode.
+Set asset to BTC.
+Set window to 15m.
+Set max position to 5.
+If a qualifying signal exists, execute the trade on Polymarket.
+Report the selected market, signal details, and final order result.
+```
+
+Conservative live template:
+
+```text
+First run polymarket-fast-loop in dry-run mode for BTC 15m with max position 5.
+If the signal qualifies and the market is tradeable, run polymarket-fast-loop in live mode with the same settings.
+Report both the dry-run decision and the live execution result.
+```
+
+For recurring runs, keep the prompt explicit and stable. Avoid vague instructions like `run the trader normally`, because the skill defaults to `dry-run` when the mode is omitted.
 
 ## Quick Start
 
 ```bash
 # Install dependencies
-pip install -r requirements.txt
+uv sync
 
-# Set your private key
-export POLYMARKET_PRIVATE_KEY="0xyour-private-key-here"
-
-# Dry run — see what would happen
 # Dry run
 uv run python scripts/fastloop_trader.py
 
-# Go live
+# Record a qualifying paper trade
+uv run python scripts/fastloop_trader.py --record-paper
+
+# Execute a live trade
 uv run python scripts/fastloop_trader.py --live
 
-# Live + smart sizing (5% of portfolio per trade)
-uv run python scripts/fastloop_trader.py --live --smart-sizing
+# Record using smart sizing (5% of remaining paper cash, capped by max_position)
+uv run python scripts/fastloop_trader.py --record-paper --smart-sizing
 ```
 
-## How to Run on a Loop
+## Looping
 
-The script runs **one cycle** — your bot drives the loop. Set up a cron job or heartbeat:
-
-**Every 5 minutes (one per fast market window):**
-```
-*/5 * * * * cd /path/to/skill && uv run python scripts/fastloop_trader.py --live 
+```bash
+*/5 * * * * cd /path/to/skill && uv run python scripts/fastloop_trader.py --live
 ```
 
-**Every 1 minute (more aggressive, catches mid-window opportunities):**
-```
-* * * * * cd /path/to/skill && uv run python scripts/fastloop_trader.py --live 
-```
+Or for signal-only monitoring:
 
-**Via OpenClaw heartbeat:** Add to your HEARTBEAT.md:
-```
-Run: cd /path/to/fast market && uv run python scripts/fastloop_trader.py --live 
+```bash
+* * * * * cd /path/to/skill && uv run python scripts/fastloop_trader.py
 ```
 
 ## Configuration
 
-Configure via `config.json`, environment variables, or `--set`:
+The script reads `config.json` from the skill root. You can update settings with `--set`:
 
 ```bash
-# Change entry threshold
-uv run python scripts/fastloop_trader.py --set entry_threshold=0.08
-
-# Trade ETH instead of BTC
 uv run python scripts/fastloop_trader.py --set asset=ETH
-
-# Multiple settings
-uv run python scripts/fastloop_trader.py --set min_momentum_pct=0.3 --set max_position=10
+uv run python scripts/fastloop_trader.py --set window=5m
+uv run python scripts/fastloop_trader.py --set max_position=10
 ```
 
 ### Settings
 
 | Setting | Default | Env Var | Description |
 |---------|---------|---------|-------------|
-| `entry_threshold` | 0.05 | `PM_FASTLOOP_ENTRY` | Min price divergence from 50¢ to trigger |
-| `min_momentum_pct` | 0.5 | `PM_FASTLOOP_MOMENTUM` | Min BTC % move to trigger |
-| `max_position` | 5.0 | `PM_FASTLOOP_MAX_POSITION` | Max $ per trade |
-| `signal_source` | binance | `PM_FASTLOOP_SIGNAL` | Price feed (binance, coingecko) |
-| `lookback_minutes` | 5 | `PM_FASTLOOP_LOOKBACK` | Minutes of price history |
-| `min_time_remaining` | 60 | `PM_FASTLOOP_MIN_TIME` | Skip fast markets with less time left (seconds) |
-| `asset` | BTC | `PM_FASTLOOP_ASSET` | Asset to trade (BTC, ETH, SOL) |
-| `window` | 5m | `PM_FASTLOOP_WINDOW` | Market window duration (5m or 15m) |
-| `volume_confidence` | true | `PM_FASTLOOP_VOL_CONF` | Weight signal by Binance volume |
-
-### Example config.json
-
-```json
-{
-  "entry_threshold": 0.08,
-  "min_momentum_pct": 0.3,
-  "max_position": 10.0,
-  "asset": "BTC",
-  "window": "5m",
-  "signal_source": "binance"
-}
-```
+| `entry_threshold` | `0.05` | `PM_FASTLOOP_ENTRY` | Minimum divergence from 50c |
+| `min_momentum_pct` | `0.5` | `PM_FASTLOOP_MOMENTUM` | Minimum move over lookback window |
+| `max_position` | `5.0` | `PM_FASTLOOP_MAX_POSITION` | Maximum dollars per trade |
+| `signal_source` | `binance` | `PM_FASTLOOP_SIGNAL` | Price feed source |
+| `lookback_minutes` | `5` | `PM_FASTLOOP_LOOKBACK` | Lookback window in minutes |
+| `min_time_remaining` | `60` | `PM_FASTLOOP_MIN_TIME` | Skip markets too close to expiry |
+| `asset` | `BTC` | `PM_FASTLOOP_ASSET` | Asset to trade |
+| `window` | `5m` | `PM_FASTLOOP_WINDOW` | Fast-market duration |
+| `volume_confidence` | `true` | `PM_FASTLOOP_VOL_CONF` | Filter out thin volume moves |
+| `paper_trade_db` | `fastloop_paper.db` | `PM_FASTLOOP_DB` | SQLite path for paper trades |
 
 ## CLI Options
 
 ```bash
-uv run python scripts/fastloop_trader.py                    # Dry run
-uv run python scripts/fastloop_trader.py --live             # Real trades
-uv run python scripts/fastloop_trader.py --live      # Silent except trades/errors
-uv run python scripts/fastloop_trader.py --smart-sizing     # Portfolio-based sizing
-uv run python scripts/fastloop_trader.py --positions        # Show open fast market positions
-uv run python scripts/fastloop_trader.py --config           # Show current config
-uv run python scripts/fastloop_trader.py --set KEY=VALUE    # Update config
+uv run python scripts/fastloop_trader.py                 # Dry run
+uv run python scripts/fastloop_trader.py --record-paper  # Record paper trade
+uv run python scripts/fastloop_trader.py --live          # Execute real trade
+uv run python scripts/fastloop_trader.py --positions     # Show live fast-market positions
+uv run python scripts/fastloop_trader.py --paper-positions # Show paper positions
+uv run python scripts/fastloop_trader.py --config        # Show resolved config path and DB path
+uv run python scripts/fastloop_trader.py --set KEY=VALUE # Update config.json
 ```
 
 ## Signal Logic
 
-Default signal (Binance momentum):
+Default signal:
 
-1. Fetch last 5 one-minute candles from Binance (`BTCUSDT`)
-2. Calculate momentum: `(price_now - price_5min_ago) / price_5min_ago`
-3. Compare momentum direction to current Polymarket odds
-4. Trade when:
-   - Momentum ≥ `min_momentum_pct` (default 0.5%)
-   - Price diverges from 50¢ by ≥ `entry_threshold` (default 5¢)
-   - Volume ratio > 0.5x average (filters out thin moves)
+1. Fetch recent 1-minute candles from Binance.
+2. Measure momentum over the configured lookback.
+3. Compare direction and fixed divergence thresholds against current Polymarket odds.
+4. Reject low-volume, low-momentum, or fee-unfavorable entries.
+5. On `--record-paper`, store the entry in SQLite instead of placing a live order.
+6. On `--live`, place a real order through the Polymarket CLOB client.
 
-**Example:** BTC up 0.8% in last 5 min, but fast market YES price is only $0.52. The 3¢ divergence from the expected ~$0.55 → buy YES.
+This is still a template strategy. The current fair-value model is simple and should not be treated as production alpha.
 
-### Customizing Your Signal
+## Database
 
-The default momentum signal is a starting point. To add your own edge:
-
-- **Multi-exchange:** Compare prices across Binance, Kraken, Bitfinex — divergence between exchanges can predict CLOB direction
-- **Sentiment:** Layer in Twitter/social signals — a viral tweet can move fast markets
-- **Technical indicators:** RSI, VWAP, order flow analysis
-- **News:** Breaking news correlation — use your agent's reasoning to interpret headlines
-
-The skill handles all the Polymarket CLOB plumbing (discovery, order signing, trade execution). Your agent provides the alpha.
-
-## Example Output
-
-```
-⚡ Polymarket FastLoop Trader
-==================================================
-
-  [DRY RUN] No trades will be executed. Use --live to enable trading.
-
-⚙️  Configuration:
-  Asset:            BTC
-  Entry threshold:  0.05 (min divergence from 50¢)
-  Min momentum:     0.5% (min price move)
-  Max position:     $5.00
-  Signal source:    binance
-  Lookback:         5 minutes
-  Min time left:    60s
-  Volume weighting: ✓
-
-🔍 Discovering BTC fast markets...
-  Found 3 active fast markets
-
-🎯 Selected: Bitcoin Up or Down - February 15, 5:30AM-5:35AM ET
-  Expires in: 185s
-  Current YES price: $0.480
-
-📈 Fetching BTC price signal (binance)...
-  Price: $97,234.50 (was $96,812.30)
-  Momentum: +0.436%
-  Direction: up
-  Volume ratio: 1.45x avg
-
-🧠 Analyzing...
-  ⏸️  Momentum 0.436% < minimum 0.500% — skip
-
-📊 Summary: No trade (momentum too weak: 0.436%)
-```
-
-## Source Tagging
-
-All trades are tagged with `source: "clob:fastloop"`. This helps track fast market P&L separately.
-
-## Token Approvals
-
-Before your first trade, your wallet needs to approve Polymarket's exchange contracts to spend your USDC.e and conditional tokens on Polygon. See the [Polymarket CLOB documentation](https://docs.polymarket.com/developers/CLOB/quickstart) for details.
+The script can create a local SQLite file, `fastloop_paper.db`, with:
+- `fastloop_trades`: recorded paper entries
+- `portfolio`: a lightweight snapshot of remaining paper cash and open positions
 
 ## Troubleshooting
 
 **"No active fast markets found"**
-- Fast markets may not be running (off-hours, weekends)
-- Check Polymarket directly for active BTC fast markets
+- Fast markets may not be running
+- Gamma API results may have changed format
 
-**"No fast markets with >60s remaining"**
-- Current window is about to expire, next one isn't live yet
-- Reduce `min_time_remaining` if you want to trade closer to expiry
+**"No tradeable fast_markets"**
+- Current window is near expiry
+- Market metadata may be missing token IDs
 
 **"Failed to fetch price data"**
-- Binance API may be down or rate limited
-- Try `--set signal_source=coingecko` as fallback
+- Binance may be unavailable or rate-limiting
+- `coingecko` is only a weak fallback because it has no candle history here
+
+**"Paper trade not recorded"**
+- The same market/direction was already recorded
+- Remaining paper cash is too low for the configured size
 
 **"Trade failed" / order errors**
-- Check that your wallet has sufficient USDC.e balance on Polygon
-- Ensure token approvals are set for Polymarket exchange contracts
-- Fast market may have thin orderbook — try smaller position size
+- Check `POLYMARKET_PRIVATE_KEY`
+- Confirm the wallet has funds and approvals set
+- Fast markets may have thin books or have moved before the FOK order landed

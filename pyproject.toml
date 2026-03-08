@@ -1,7 +1,7 @@
 [project]
 name = "polymarket-fast-loop"
 version = "0.1.0"
-description = "A project using py-clob-client with optimized dependency resolution"
+description = "Polymarket fast-market trader with dry-run, paper, and live modes"
 requires-python = ">=3.10,<=3.13"
 authors = [
     { name = "William", email = "william.wu@0g.ai" }
@@ -12,4 +12,4 @@ dependencies = [
     "httpx[socks]",
 ]
 [project.scripts]
-polymarket-fast-loop = "script.fastloop_trader:main"
+polymarket-fast-loop = "scripts.fastloop_trader:main"
