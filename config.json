@@ -1,0 +1,12 @@
+{
+  "entry_threshold": 0.05,
+  "min_momentum_pct": 0.2,
+  "max_position": 2.0,
+  "lookback_minutes": 15,
+  "min_time_remaining": 60,
+  "asset": "BTC",
+  "window": "15m",
+  "signal_source": "binance",
+  "volume_confidence": true,
+  "trade_db": "polymarket_fast_market_paper.db"
+}

@@ -1,7 +1,7 @@
 [project]
-name = "polymarket-fast-loop"
+name = "polymarket-fast-market"
 version = "0.1.0"
-description = "Polymarket fast-market trader with dry-run, paper, and live modes"
+description = "Polymarket fast-market trader with paper and live modes"
 requires-python = ">=3.10,<=3.13"
 authors = [
     { name = "William", email = "william.wu@0g.ai" }
@@ -10,6 +10,7 @@ dependencies = [
     "py-clob-client>=0.34.6",
     "python-dotenv>=1.0.1",
     "httpx[socks]",
+    "torch>=2.2",
 ]
 [project.scripts]
-polymarket-fast-loop = "scripts.fastloop_trader:main"
+polymarket-fast-market = "scripts.polymarket_fast_market:main"
