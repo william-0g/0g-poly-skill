@@ -10,7 +10,11 @@ dependencies = [
     "py-clob-client>=0.34.6",
     "python-dotenv>=1.0.1",
     "httpx[socks]",
+    "numpy>=1.26",
+    "pandas>=2.2",
+    "pyarrow>=16.0",
     "torch>=2.2",
+    "websocket-client",
 ]
 [project.scripts]
 polymarket-fast-market = "scripts.polymarket_fast_market:main"

@@ -24,6 +24,7 @@ import json
 import sqlite3
 import argparse
 import time
+import threading
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from urllib.parse import quote
@@ -32,10 +33,15 @@ from urllib.error import HTTPError, URLError
 from zoneinfo import ZoneInfo
 
 from scripts.quant_model import (
-    build_quant_model,
     evaluate_consensus_signal,
-    order_book_vector_from_summary,
+    load_quant_model,
 )
+from scripts.polymarket_features import OnlineFeatureBuffer
+
+try:
+    import websocket
+except ImportError:
+    websocket = None
 
 # Force line-buffered stdout for non-TTY environments (cron, Docker, OpenClaw)
 sys.stdout.reconfigure(line_buffering=True)
@@ -120,14 +126,338 @@ SMART_SIZING_PCT = 0.05  # 5% of balance per trade
 MIN_SHARES_PER_ORDER = 5  # Polymarket minimum
 DEFAULT_PAPER_CASH = 100.0
 NEW_YORK_TZ = ZoneInfo("America/New_York")
+GAMMA_HOST = "https://gamma-api.polymarket.com"
 CLOB_HOST = "https://clob.polymarket.com"
 DATA_API = "https://data-api.polymarket.com"
+MARKET_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 DEFAULT_LOOP_INTERVAL_SECONDS = 5
 SESSION_SCHEMA_VERSION = "1.0"
 TRADES_TABLE = "polymarket_fast_market_trades"
 LEGACY_TRADES_TABLE = "".join(["fast", "loop", "_trades"])
 ORDER_BOOK_FEATURE_DIM = 6
-QUANT_SIGNAL_MODEL = build_quant_model(order_book_dim=ORDER_BOOK_FEATURE_DIM)
+MODEL_CHECKPOINTS = {
+    ("BTC", "15m"): Path(__file__).resolve().parents[1] / "models" / "btc-15min.pt",
+    ("ETH", "15m"): Path(__file__).resolve().parents[1] / "models" / "eth-15min.pt",
+}
+_QUANT_MODEL_CACHE = {}
+_FEATURE_BUFFER_CACHE = {}
+_MARKET_STREAM_CACHE = {}
+
+
+def _resolve_quant_signal_model(asset, window):
+    key = (str(asset).upper(), str(window))
+    cached = _QUANT_MODEL_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    checkpoint_path = MODEL_CHECKPOINTS.get(key)
+    if checkpoint_path and checkpoint_path.exists():
+        try:
+            model = load_quant_model(checkpoint_path)
+            resolved = {
+                "model": model,
+                "enabled": True,
+                "source": "checkpoint",
+                "checkpoint": str(checkpoint_path),
+                "loaded": True,
+                "error": None,
+            }
+            _QUANT_MODEL_CACHE[key] = resolved
+            return resolved
+        except Exception as exc:
+            resolved = {
+                "model": None,
+                "enabled": False,
+                "source": "disabled",
+                "checkpoint": str(checkpoint_path),
+                "loaded": False,
+                "error": str(exc),
+            }
+            _QUANT_MODEL_CACHE[key] = resolved
+            return resolved
+
+    resolved = {
+        "model": None,
+        "enabled": False,
+        "source": "disabled",
+        "checkpoint": str(checkpoint_path) if checkpoint_path else None,
+        "loaded": False,
+        "error": None,
+    }
+    _QUANT_MODEL_CACHE[key] = resolved
+    return resolved
+
+
+def _get_or_create_feature_buffer(
+    slug,
+    market_end_ts,
+    *,
+    sequence_steps,
+    step_seconds,
+    target_asset_id=None,
+    strict_asset_id=True,
+):
+    if not slug or not market_end_ts:
+        return None
+
+    cache_key = str(slug)
+    cached = _FEATURE_BUFFER_CACHE.get(cache_key)
+    if cached is not None:
+        if (
+            cached.market_end_ts == market_end_ts
+            and cached.sequence_steps == sequence_steps
+            and cached.step_seconds == step_seconds
+            and cached.target_asset_id == (str(target_asset_id) if target_asset_id is not None else None)
+            and cached.strict_asset_id == bool(strict_asset_id)
+        ):
+            return cached
+        _FEATURE_BUFFER_CACHE.pop(cache_key, None)
+
+    buffer = OnlineFeatureBuffer(
+        market_end_ts=market_end_ts,
+        sequence_steps=sequence_steps,
+        step_seconds=step_seconds,
+        slug=slug,
+        target_asset_id=target_asset_id,
+        strict_asset_id=strict_asset_id,
+    )
+    _FEATURE_BUFFER_CACHE[cache_key] = buffer
+    return buffer
+
+
+def _feature_sampling_config(window):
+    if str(window) == "5m":
+        return {"sequence_steps": 15, "step_seconds": 20}
+    return {"sequence_steps": 15, "step_seconds": 60}
+
+
+def _coerce_price(value):
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _coerce_timestamp_ms(value):
+    if value is None:
+        return None
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return value
+    if numeric > 1e12:
+        return int(numeric)
+    return int(numeric * 1000)
+
+
+def _parse_order_levels(levels):
+    parsed = []
+    for level in levels or []:
+        if isinstance(level, dict):
+            price = _coerce_price(level.get("price"))
+            size = _coerce_price(level.get("size"))
+        elif isinstance(level, (list, tuple)) and len(level) >= 2:
+            price = _coerce_price(level[0])
+            size = _coerce_price(level[1])
+        else:
+            continue
+        if price is None or size is None:
+            continue
+        parsed.append({"price": price, "size": size})
+    return parsed
+
+
+def _normalize_market_ws_events(payload):
+    if isinstance(payload, list):
+        normalized = []
+        for item in payload:
+            normalized.extend(_normalize_market_ws_events(item))
+        return normalized
+    if not isinstance(payload, dict):
+        return []
+
+    asset_id = payload.get("asset_id") or payload.get("assetId")
+    timestamp = payload.get("timestamp")
+    event_type = str(payload.get("event_type") or payload.get("type") or "").lower()
+
+    if event_type == "book":
+        bids = _parse_order_levels(payload.get("bids"))
+        asks = _parse_order_levels(payload.get("asks"))
+        best_bid = max((level["price"] for level in bids), default=None)
+        best_ask = min((level["price"] for level in asks), default=None)
+        return [{
+            "timestamp": _coerce_timestamp_ms(timestamp),
+            "asset_id": asset_id,
+            "event_type": "book",
+            "hash": payload.get("hash"),
+            "best_bid": best_bid,
+            "best_ask": best_ask,
+            "bid_sizes": [level["size"] for level in sorted(bids, key=lambda item: item["price"], reverse=True)[:5]],
+            "ask_sizes": [level["size"] for level in sorted(asks, key=lambda item: item["price"])[:5]],
+        }]
+
+    if event_type == "price_change":
+        return [{
+            "timestamp": _coerce_timestamp_ms(timestamp),
+            "asset_id": asset_id,
+            "event_type": "price_change",
+            "hash": payload.get("hash"),
+            "best_bid": _coerce_price(payload.get("best_bid")),
+            "best_ask": _coerce_price(payload.get("best_ask")),
+            "pc_price": _coerce_price(payload.get("price")),
+            "pc_size": _coerce_price(payload.get("size")),
+            "pc_side": payload.get("side"),
+        }]
+
+    if event_type == "last_trade_price":
+        return [{
+            "timestamp": _coerce_timestamp_ms(timestamp),
+            "asset_id": asset_id,
+            "event_type": "last_trade_price",
+            "hash": payload.get("hash"),
+            "best_bid": _coerce_price(payload.get("best_bid")),
+            "best_ask": _coerce_price(payload.get("best_ask")),
+            "trade_price": _coerce_price(payload.get("price")),
+            "trade_size": _coerce_price(payload.get("size")),
+            "trade_side": payload.get("side"),
+        }]
+
+    if event_type == "best_bid_ask":
+        return [{
+            "timestamp": _coerce_timestamp_ms(timestamp),
+            "asset_id": asset_id,
+            "event_type": "best_bid_ask",
+            "best_bid": _coerce_price(payload.get("bid") or payload.get("best_bid")),
+            "best_ask": _coerce_price(payload.get("ask") or payload.get("best_ask")),
+        }]
+
+    if event_type == "tick_size_change":
+        return [{
+            "timestamp": _coerce_timestamp_ms(timestamp),
+            "asset_id": asset_id,
+            "event_type": "tick_size_change",
+            "new_tick_size": _coerce_price(payload.get("tick_size") or payload.get("new_tick_size")),
+        }]
+
+    return []
+
+
+class MarketEventStream:
+    def __init__(self, *, slug, asset_id, feature_buffer):
+        self.slug = slug
+        self.asset_id = str(asset_id)
+        self.feature_buffer = feature_buffer
+        self.last_error = None
+        self.last_message_at = None
+        self.events_received = 0
+        self.messages_received = 0
+        self.connected = False
+        self._stop_event = threading.Event()
+        self._ready_event = threading.Event()
+        self._lock = threading.Lock()
+        self._thread = threading.Thread(target=self._run, name=f"pm-market-ws:{slug}", daemon=True)
+        self._thread.start()
+
+    def _run(self):
+        backoff = 1.0
+        while not self._stop_event.is_set():
+            if websocket is None:
+                with self._lock:
+                    self.last_error = "websocket-client-not-installed"
+                return
+            ws = None
+            try:
+                ws = websocket.create_connection(
+                    MARKET_WS_URL,
+                    timeout=10,
+                    header=["User-Agent: polymarket-fast-market/1.0"],
+                )
+                subscribe_payload = {
+                    "type": "market",
+                    "assets_ids": [self.asset_id],
+                }
+                ws.send(json.dumps(subscribe_payload))
+                with self._lock:
+                    self.connected = True
+                    self.last_error = None
+                backoff = 1.0
+                while not self._stop_event.is_set():
+                    raw_message = ws.recv()
+                    if raw_message is None:
+                        raise RuntimeError("market-websocket-closed")
+                    messages = _normalize_market_ws_events(json.loads(raw_message))
+                    with self._lock:
+                        self.messages_received += 1
+                        self.last_message_at = datetime.now(timezone.utc).isoformat()
+                    for message in messages:
+                        if self.feature_buffer.ingest_event(message):
+                            with self._lock:
+                                self.events_received += 1
+                                self._ready_event.set()
+            except Exception as exc:
+                with self._lock:
+                    self.connected = False
+                    self.last_error = str(exc)
+                if self._stop_event.wait(backoff):
+                    break
+                backoff = min(backoff * 2.0, 15.0)
+            finally:
+                if ws is not None:
+                    try:
+                        ws.close()
+                    except Exception:
+                        pass
+        with self._lock:
+            self.connected = False
+
+    def wait_until_ready(self, timeout=1.0):
+        return self._ready_event.wait(timeout)
+
+    def snapshot(self):
+        with self._lock:
+            return {
+                "slug": self.slug,
+                "asset_id": self.asset_id,
+                "connected": self.connected,
+                "events_received": self.events_received,
+                "messages_received": self.messages_received,
+                "last_message_at": self.last_message_at,
+                "last_error": self.last_error,
+            }
+
+    def stop(self):
+        self._stop_event.set()
+        self._ready_event.set()
+        if self._thread.is_alive():
+            self._thread.join(timeout=1.0)
+
+
+def _prune_market_streams(active_slug):
+    for slug, stream in list(_MARKET_STREAM_CACHE.items()):
+        if slug == active_slug:
+            continue
+        stream.stop()
+        _MARKET_STREAM_CACHE.pop(slug, None)
+
+
+def _ensure_market_event_stream(*, slug, feature_token_id, feature_buffer):
+    if not slug or not feature_token_id or feature_buffer is None:
+        return None
+    _prune_market_streams(slug)
+    cached = _MARKET_STREAM_CACHE.get(slug)
+    if cached is not None and cached.asset_id == str(feature_token_id):
+        return cached
+    if cached is not None:
+        cached.stop()
+    stream = MarketEventStream(
+        slug=slug,
+        asset_id=feature_token_id,
+        feature_buffer=feature_buffer,
+    )
+    _MARKET_STREAM_CACHE[slug] = stream
+    return stream
 
 # Asset → Binance symbol mapping
 ASSET_SYMBOLS = {
@@ -300,39 +630,82 @@ def expected_fast_market_slug(asset="BTC", window="5m", now=None):
     return f"{_asset_slug_prefix(asset)}-updown-{window}-{int(bucket_start.timestamp())}", bucket_start
 
 
+def _parse_json_list(value):
+    if isinstance(value, list):
+        return value
+    if value is None:
+        return []
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return []
+        try:
+            parsed = json.loads(stripped)
+        except json.JSONDecodeError:
+            return []
+        return parsed if isinstance(parsed, list) else []
+    return []
+
+
+def _resolve_binary_token_mapping(outcomes, clob_token_ids):
+    labels = [str(label or "").strip() for label in outcomes]
+    normalized = [label.lower() for label in labels]
+    yes_index = None
+    no_index = None
+    for index, label in enumerate(normalized):
+        if label in {"yes", "up", "higher", "above", "true"} and yes_index is None:
+            yes_index = index
+        if label in {"no", "down", "lower", "below", "false"} and no_index is None:
+            no_index = index
+    if yes_index is None and len(clob_token_ids) > 0:
+        yes_index = 0
+    if no_index is None and len(clob_token_ids) > 1:
+        no_index = 1 if yes_index != 1 else 0
+    yes_token_id = clob_token_ids[yes_index] if yes_index is not None and yes_index < len(clob_token_ids) else None
+    no_token_id = clob_token_ids[no_index] if no_index is not None and no_index < len(clob_token_ids) else None
+    return {
+        "yes_index": yes_index,
+        "no_index": no_index,
+        "yes_token_id": yes_token_id,
+        "no_token_id": no_token_id,
+        "feature_token_id": clob_token_ids[0] if clob_token_ids else None,
+    }
+
+
 def fetch_market_by_slug(slug, window):
     """Fetch a specific fast market by its exact slug."""
-    url = (
-        "https://gamma-api.polymarket.com/markets"
-        f"?slug={quote(slug)}"
-    )
+    url = f"{GAMMA_HOST}/markets/slug/{quote(slug)}"
     result = _api_request(url)
     if not result or isinstance(result, dict) and result.get("error"):
         return None
 
-    markets = result if isinstance(result, list) else [result]
-    for m in markets:
-        if m.get("slug") != slug:
-            continue
-        interval = _extract_market_interval(m, window)
-        try:
-            clob_token_ids = json.loads(m.get("clobTokenIds", "[]"))
-        except (json.JSONDecodeError, TypeError):
-            clob_token_ids = []
-        return {
-            "question": m.get("question", ""),
-            "slug": slug,
-            "condition_id": m.get("conditionId", ""),
-            "slug_timestamp": _parse_slug_timestamp(slug),
-            "start_time": interval["start_time"],
-            "end_time": interval["end_time"],
-            "closed": bool(m.get("closed", False)),
-            "outcomes": m.get("outcomes", []),
-            "outcome_prices": m.get("outcomePrices", "[]"),
-            "fee_rate_bps": int(m.get("fee_rate_bps") or m.get("feeRateBps") or 0),
-            "clob_token_ids": clob_token_ids,
-        }
-    return None
+    market = result[0] if isinstance(result, list) else result
+    if market.get("slug") != slug:
+        return None
+
+    interval = _extract_market_interval(market, window)
+    clob_token_ids = [str(token) for token in _parse_json_list(market.get("clobTokenIds"))]
+    outcomes = _parse_json_list(market.get("outcomes"))
+    outcome_prices = _parse_json_list(market.get("outcomePrices"))
+    token_mapping = _resolve_binary_token_mapping(outcomes, clob_token_ids)
+    return {
+        "question": market.get("question", ""),
+        "slug": slug,
+        "condition_id": market.get("conditionId", ""),
+        "slug_timestamp": _parse_slug_timestamp(slug),
+        "start_time": interval["start_time"],
+        "end_time": interval["end_time"],
+        "closed": bool(market.get("closed", False)),
+        "outcomes": outcomes,
+        "outcome_prices": outcome_prices,
+        "fee_rate_bps": int(market.get("fee_rate_bps") or market.get("feeRateBps") or 0),
+        "clob_token_ids": clob_token_ids,
+        "yes_index": token_mapping["yes_index"],
+        "no_index": token_mapping["no_index"],
+        "yes_token_id": token_mapping["yes_token_id"],
+        "no_token_id": token_mapping["no_token_id"],
+        "feature_token_id": token_mapping["feature_token_id"],
+    }
 
 
 def _window_duration(window):
@@ -627,12 +1000,16 @@ def fetch_orderbook_summary(clob_token_ids):
         top_ask_levels = sorted(ask_levels, key=lambda level: level["price"])[:5]
         bid_depth_usd = sum(level["price"] * level["size"] for level in top_bid_levels)
         ask_depth_usd = sum(level["price"] * level["size"] for level in top_ask_levels)
+        bid_sizes = [round(level["size"], 6) for level in top_bid_levels]
+        ask_sizes = [round(level["size"], 6) for level in top_ask_levels]
         return {
             "best_bid": round(best_bid, 6),
             "best_ask": round(best_ask, 6),
             "spread_pct": round(spread_pct, 6),
             "bid_depth_usd": round(bid_depth_usd, 6),
             "ask_depth_usd": round(ask_depth_usd, 6),
+            "bid_sizes": bid_sizes,
+            "ask_sizes": ask_sizes,
         }
     except (TypeError, ValueError, KeyError, IndexError):
         return None
@@ -1050,16 +1427,22 @@ def _parse_yes_price(market):
         except (TypeError, ValueError):
             pass
     try:
-        prices = json.loads(market.get("outcome_prices", "[]"))
-        return float(prices[0]) if prices else 0.5
+        prices = market.get("outcome_prices")
+        if isinstance(prices, str):
+            prices = json.loads(prices)
+        yes_index = market.get("yes_index")
+        if isinstance(prices, list) and yes_index is not None and yes_index < len(prices):
+            return float(prices[yes_index])
+        if isinstance(prices, list) and prices:
+            return float(prices[0])
     except (json.JSONDecodeError, IndexError, TypeError, ValueError):
         return 0.5
+    return 0.5
 
 
 def refresh_market_price(market):
     """Overlay live CLOB midpoint onto the market snapshot when available."""
-    token_ids = market.get("clob_token_ids") or []
-    yes_token_id = token_ids[0] if len(token_ids) > 0 else None
+    yes_token_id = market.get("yes_token_id")
     live_yes_price = get_token_midpoint(yes_token_id)
     if live_yes_price is not None:
         market["live_yes_price"] = live_yes_price
@@ -1395,6 +1778,7 @@ def _resolve_open_trade_market(trade_row, default_market=None):
 # =============================================================================
 
 def run_fast_market_strategy(
+    session_started_at_ts=None,
     live_mode=False,
     positions_only=False,
     paper_positions_only=False,
@@ -1402,6 +1786,7 @@ def run_fast_market_strategy(
     smart_sizing=False,
     quiet=False,
     simple_display=False,
+    debug_model=False,
 ):
     """Run one cycle of the fast-market trading strategy and return a cycle summary."""
 
@@ -1424,7 +1809,13 @@ def run_fast_market_strategy(
         "last_open_trade": None,
         "closed_trades": [],
         "error": None,
+        "debug_model": debug_model,
     }
+    startup_started_at = (
+        datetime.fromtimestamp(session_started_at_ts, timezone.utc)
+        if session_started_at_ts is not None
+        else None
+    )
 
     def log(msg, force=False):
         if not quiet or force:
@@ -1437,6 +1828,72 @@ def run_fast_market_strategy(
         cycle["error"] = error
         cycle["cycle_completed_at"] = datetime.now(timezone.utc).isoformat()
         return cycle
+
+    def log_model_debug(feature_window, model_info):
+        if not debug_model or feature_window is None:
+            return
+        try:
+            ohlcv = feature_window.ohlcv
+            order_book = feature_window.order_book
+            price = feature_window.price
+            log("\n🧪 Model Debug")
+            log(
+                "  Window: "
+                f"slug={feature_window.slug} "
+                f"start={feature_window.market_start_ts} "
+                f"end={feature_window.market_end_ts} "
+                f"observed={feature_window.observed_end_ts}"
+            )
+            log(
+                "  Shapes: "
+                f"ohlcv={getattr(ohlcv, 'shape', None)} "
+                f"order_book={getattr(order_book, 'shape', None)} "
+                f"price={getattr(price, 'shape', None)}"
+            )
+            log(
+                "  Price stats: "
+                f"first={float(price[0][0]):.6f} "
+                f"last={float(price[-1][0]):.6f} "
+                f"min={float(price.min()):.6f} "
+                f"max={float(price.max()):.6f}"
+            )
+            log(
+                "  Volume stats: "
+                f"sum={float(ohlcv[:, 4].sum()):.6f} "
+                f"last={float(ohlcv[-1, 4]):.6f} "
+                f"nonzero={int((ohlcv[:, 4] > 0).sum())}/{ohlcv.shape[0]}"
+            )
+            log(
+                "  Book stats: "
+                f"best_bid={float(order_book[-1, 0]):.6f} "
+                f"best_ask={float(order_book[-1, 1]):.6f} "
+                f"spread={float(order_book[-1, 2]):.6f} "
+                f"bid_depth={float(order_book[-1, 3]):.6f} "
+                f"ask_depth={float(order_book[-1, 4]):.6f} "
+                f"imbalance={float(order_book[-1, 5]):.6f}"
+            )
+            repeated_rows = 0
+            for idx in range(1, len(price)):
+                if float(price[idx][0]) == float(price[idx - 1][0]):
+                    repeated_rows += 1
+            log(f"  Sequence repeats: {repeated_rows}/{max(len(price) - 1, 1)} adjacent price rows unchanged")
+            model = model_info.get("model")
+            if model is not None:
+                prepared = model.prepare_features(
+                    ohlcv=feature_window.ohlcv,
+                    order_book=feature_window.order_book,
+                    price=feature_window.price,
+                )
+                log(
+                    "  Prepared features: "
+                    f"shape={tuple(prepared.shape)} "
+                    f"mean={float(prepared.mean()):.6f} "
+                    f"std={float(prepared.std()):.6f} "
+                    f"min={float(prepared.min()):.6f} "
+                    f"max={float(prepared.max()):.6f}"
+                )
+        except Exception as exc:
+            log(f"  Model debug failed: {exc}")
 
     log("⚡ Polymarket Fast Market Trader")
     log("=" * 50)
@@ -1557,6 +2014,15 @@ def run_fast_market_strategy(
     end_time = best.get("end_time")
     remaining = (end_time - datetime.now(timezone.utc)).total_seconds() if end_time else 0
     market_yes_price = _parse_yes_price(best)
+    startup_skip_current_market = (
+        startup_started_at is not None
+        and startup_started_at > expected_start + timedelta(seconds=30)
+    )
+    startup_lag_seconds = (
+        (startup_started_at - expected_start).total_seconds()
+        if startup_started_at is not None
+        else None
+    )
     cycle["market"] = {
         "question": best["question"],
         "slug": best.get("slug"),
@@ -1566,6 +2032,9 @@ def run_fast_market_strategy(
         "end_time": best.get("end_time"),
         "seconds_to_expiry": round(remaining, 3),
         "yes_price": round(market_yes_price, 6),
+        "startup_started_at": startup_started_at.isoformat() if startup_started_at is not None else None,
+        "startup_lag_seconds": round(startup_lag_seconds, 3) if startup_lag_seconds is not None else None,
+        "startup_skip_current_market": startup_skip_current_market,
     }
 
     log(f"\n🎯 Selected: {best['question']}")
@@ -1575,6 +2044,21 @@ def run_fast_market_strategy(
         log(f"  Interval start: {best['start_time'].astimezone(NEW_YORK_TZ).strftime('%Y-%m-%d %I:%M:%S %p %Z')}")
     log(f"  Expires in: {remaining:.0f}s")
     log(f"  Current YES price: ${market_yes_price:.3f}")
+    if startup_skip_current_market:
+        log(
+            "  Startup guard: current event started "
+            f"{startup_lag_seconds:.0f}s before this process; wait for the next event"
+        )
+        if not quiet:
+            print(
+                "📊 Summary: No trade❌ "
+                f"(started {startup_lag_seconds:.0f}s after event open; waiting for next event)"
+            )
+        return finalize(
+            "ok",
+            action="wait-next-event",
+            reason="startup-too-late-for-current-event",
+        )
 
     execution_mode = "live" if live_mode else "paper"
     latest_open_trade = get_latest_open_trade_for_mode(execution_mode)
@@ -1591,9 +2075,10 @@ def run_fast_market_strategy(
         log(f"  Fee rate:         {fee_rate:.0%} (Polymarket fast market fee)")
 
     clob_token_ids = best.get("clob_token_ids", [])
-    yes_token_id = clob_token_ids[0] if len(clob_token_ids) > 0 else None
-    no_token_id = clob_token_ids[1] if len(clob_token_ids) > 1 else None
-    cycle["order_book"] = fetch_orderbook_summary(clob_token_ids)
+    yes_token_id = best.get("yes_token_id")
+    no_token_id = best.get("no_token_id")
+    feature_token_id = best.get("feature_token_id")
+    cycle["order_book"] = fetch_orderbook_summary([yes_token_id])
     if cycle["order_book"] is not None:
         log(
             f"  Order book: bid ${cycle['order_book']['best_bid']:.3f} "
@@ -1615,19 +2100,105 @@ def run_fast_market_strategy(
         log(f"  Volume ratio: {momentum['volume_ratio']:.2f}x avg")
 
     log("\n🧠 Analyzing...")
-    ohlcv_sequence = momentum.get("ohlcv") or []
-    if not ohlcv_sequence:
-        log("  ❌ Signal payload missing OHLCV sequence", force=True)
-        return finalize("error", reason="signal-missing-ohlcv", error="signal-missing-ohlcv")
+    quant_model_info = _resolve_quant_signal_model(ASSET, WINDOW)
+    market_end_ts = int(end_time.timestamp()) if end_time else None
+    sampling = _feature_sampling_config(WINDOW)
+    feature_buffer = _get_or_create_feature_buffer(
+        best.get("slug"),
+        market_end_ts,
+        sequence_steps=sampling["sequence_steps"],
+        step_seconds=sampling["step_seconds"],
+        target_asset_id=feature_token_id,
+        strict_asset_id=True,
+    )
+    feature_stream = _ensure_market_event_stream(
+        slug=best.get("slug"),
+        feature_token_id=feature_token_id,
+        feature_buffer=feature_buffer,
+    )
+    if feature_stream is not None:
+        feature_stream.wait_until_ready(timeout=1.0)
+    feature_event_ingested = False
+    live_buffer_prediction = None
+    live_buffer_error = None
+    feature_window = None
+    if feature_buffer is not None and quant_model_info["enabled"]:
+        feature_window = feature_buffer.build_feature_window(as_of_ts=int(cycle_started_at.timestamp()))
+        feature_event_ingested = feature_window is not None
+        if feature_event_ingested:
+            log_model_debug(feature_window, quant_model_info)
+            try:
+                live_buffer_prediction = quant_model_info["model"].predict_from_live_buffer(
+                    feature_buffer,
+                    as_of_ts=int(cycle_started_at.timestamp()),
+                )
+            except Exception as exc:
+                live_buffer_error = str(exc)
+        else:
+            stream_snapshot = feature_stream.snapshot() if feature_stream is not None else None
+            if stream_snapshot and stream_snapshot.get("last_error"):
+                live_buffer_error = f"feature-stream-error:{stream_snapshot['last_error']}"
+            else:
+                live_buffer_error = "feature-window-not-ready"
 
-    order_book_sequence = [order_book_vector_from_summary(cycle["order_book"])]
-    polymarket_price_sequence = [[market_yes_price]]
+    cycle["model"] = {
+        "enabled": quant_model_info["enabled"],
+        "source": quant_model_info["source"],
+        "checkpoint": quant_model_info["checkpoint"],
+        "loaded": quant_model_info["loaded"],
+        "error": quant_model_info["error"],
+        "feature_buffer_slug": best.get("slug"),
+        "feature_token_id": feature_token_id,
+        "feature_event_ingested": feature_event_ingested,
+        "feature_stream": feature_stream.snapshot() if feature_stream is not None else None,
+        "live_buffer_prediction": live_buffer_prediction,
+        "live_buffer_error": live_buffer_error,
+    }
+    stream_snapshot = cycle["model"]["feature_stream"]
+    if quant_model_info["source"] == "checkpoint" and quant_model_info["loaded"]:
+        log(f"  Quant model: loaded checkpoint {quant_model_info['checkpoint']}")
+    elif quant_model_info["checkpoint"] and quant_model_info["error"]:
+        log(
+            "  Quant model: checkpoint load failed, using heuristic-only mode "
+            f"({quant_model_info['error']})"
+        )
+    elif not quant_model_info["enabled"]:
+        log("  Quant model: no checkpoint for this market, using heuristic-only mode")
+    else:
+        log("  Quant model: enabled")
+    if stream_snapshot is not None:
+        log(
+            "  Feature stream: "
+            f"connected={stream_snapshot.get('connected')} "
+            f"messages={stream_snapshot.get('messages_received')} "
+            f"events={stream_snapshot.get('events_received')}"
+        )
+        if stream_snapshot.get("last_message_at"):
+            log(f"  Feature stream last message: {stream_snapshot.get('last_message_at')}")
+        if stream_snapshot.get("last_error"):
+            log(f"  Feature stream error: {stream_snapshot.get('last_error')}")
+    else:
+        log("  Feature stream: unavailable")
+    log(
+        "  Feature buffer: "
+        f"token={feature_token_id} "
+        f"window_ready={feature_event_ingested}"
+    )
+    if live_buffer_prediction is not None:
+        log(
+            "  Live buffer prediction: "
+            f"{live_buffer_prediction['signal_direction']} "
+            f"(score {live_buffer_prediction['score']:+.4f}, "
+            f"p_up {live_buffer_prediction['probability_up']:.4f})"
+        )
+    elif live_buffer_error:
+        log(f"  Live buffer prediction unavailable: {live_buffer_error}")
     consensus = evaluate_consensus_signal(
-        model=QUANT_SIGNAL_MODEL,
+        model=quant_model_info["model"],
         asset=ASSET,
-        ohlcv=ohlcv_sequence,
-        order_book=order_book_sequence,
-        price=polymarket_price_sequence,
+        live_buffer=feature_buffer,
+        live_buffer_as_of_ts=int(cycle_started_at.timestamp()),
+        model_prediction=live_buffer_prediction,
         momentum=momentum,
         market_yes_price=market_yes_price,
         entry_threshold=ENTRY_THRESHOLD,
@@ -1659,6 +2230,7 @@ def run_fast_market_strategy(
         "trade_rationale": trade_rationale,
         "heuristic": heuristic_signal,
         "model": model_signal,
+        "model_source": cycle["model"],
     }
 
     log(
@@ -1667,7 +2239,8 @@ def run_fast_market_strategy(
     )
     log(
         f"  Model:     {model_signal.get('signal_direction')} -> "
-        f"{model_signal.get('proposed_side')} (score {model_signal.get('prediction'):+.4f})"
+        f"{model_signal.get('proposed_side')} "
+        f"(score {model_signal.get('prediction') if model_signal.get('prediction') is not None else 'n/a'})"
     )
 
     if heuristic_signal.get("fee_adjusted_breakeven") is not None:
@@ -1712,6 +2285,16 @@ def run_fast_market_strategy(
             )
             if not quiet:
                 print("📊 Summary: No trade❌ (model neutral)")
+            return finalize("ok", reason=reason)
+        if reason == "missing-live-buffer":
+            log("  ⏸️  Live feature buffer is not ready yet")
+            if not quiet:
+                print("📊 Summary: No trade❌ (feature buffer not ready)")
+            return finalize("ok", reason=reason)
+        if reason and reason.startswith("live-buffer-prediction-failed:"):
+            log(f"  ⏸️  Live buffer prediction failed: {reason.split(':', 1)[1]}")
+            if not quiet:
+                print("📊 Summary: No trade❌ (feature buffer prediction failed)")
             return finalize("ok", reason=reason)
         if reason == "model-disagreement":
             log(
@@ -1911,6 +2494,7 @@ def run_loop(
     quiet=False,
     simple_display=False,
     loop_interval_seconds=DEFAULT_LOOP_INTERVAL_SECONDS,
+    debug_model=False,
 ):
     """Run the strategy continuously and keep JSON session artifacts fresh."""
 
@@ -1928,6 +2512,7 @@ def run_loop(
             if simple_display:
                 print("\033[2J\033[H", end="")
             cycle = run_fast_market_strategy(
+                session_started_at_ts=session_started_at,
                 live_mode=live_mode,
                 positions_only=positions_only,
                 paper_positions_only=paper_positions_only,
@@ -1935,6 +2520,7 @@ def run_loop(
                 smart_sizing=smart_sizing,
                 quiet=quiet,
                 simple_display=simple_display,
+                debug_model=debug_model,
             )
         except KeyboardInterrupt:
             _write_summary(
@@ -1991,6 +2577,8 @@ def main():
                         help="Clear the terminal on each loop iteration for a simple dashboard-style display")
     parser.add_argument("--loop-interval-seconds", type=int, default=DEFAULT_LOOP_INTERVAL_SECONDS,
                         help="Sleep interval between long-running loop cycles")
+    parser.add_argument("--debug-model", action="store_true",
+                        help="Print live feature-window and normalized model-input diagnostics")
     args = parser.parse_args()
 
     if args.set:
@@ -2032,12 +2620,14 @@ def main():
                 quiet=args.quiet,
                 simple_display=args.simple_display,
                 loop_interval_seconds=args.loop_interval_seconds,
+                debug_model=args.debug_model,
             )
         except KeyboardInterrupt:
             print("\nStopped long-running fast loop.")
         return
 
     cycle = run_fast_market_strategy(
+        session_started_at_ts=session_started_at,
         live_mode=args.live,
         positions_only=args.positions,
         paper_positions_only=args.paper_positions,
@@ -2045,6 +2635,7 @@ def main():
         smart_sizing=args.smart_sizing,
         quiet=args.quiet,
         simple_display=args.simple_display,
+        debug_model=args.debug_model,
     )
     _append_history_event(session_started_at, cycle)
     _write_summary(
