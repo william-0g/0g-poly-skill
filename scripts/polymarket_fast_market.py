@@ -851,24 +851,33 @@ def _resolve_binance_reference_close(candles, *, window, now=None):
         return None
 
 
-def _resolve_binance_window_open(candles, *, window, now=None):
-    """Use the first 1m candle open inside the current market bucket."""
+def _resolve_binance_rolling_reference_close(candles, *, window, now=None):
+    """Use the 1m close from exactly one rolling window ago."""
     now = now or datetime.now(timezone.utc)
-    current_bucket_start = _bucket_start(now, window)
-    bucket_start_ts_ms = int(current_bucket_start.timestamp() * 1000)
-    next_bucket_ts_ms = int((current_bucket_start + timedelta(minutes=_window_minutes(window))).timestamp() * 1000)
+    current_minute = now.replace(second=0, microsecond=0)
+    target_open_ts_ms = int((current_minute - timedelta(minutes=_window_minutes(window))).timestamp() * 1000)
 
+    reference_candle = None
     for candle in candles:
         try:
             open_time_ms = int(candle[0])
         except (TypeError, ValueError, IndexError):
             continue
-        if bucket_start_ts_ms <= open_time_ms < next_bucket_ts_ms:
+        if open_time_ms == target_open_ts_ms:
             try:
-                return float(candle[1])
+                return float(candle[4])
             except (TypeError, ValueError, IndexError):
                 return None
-    return None
+        if open_time_ms <= target_open_ts_ms:
+            reference_candle = candle
+
+    if reference_candle is None:
+        return None
+
+    try:
+        return float(reference_candle[4])
+    except (TypeError, ValueError, IndexError):
+        return None
 
 
 def get_binance_momentum(symbol="BTCUSDT", lookback_minutes=5, window="5m"):
@@ -892,13 +901,13 @@ def get_binance_momentum(symbol="BTCUSDT", lookback_minutes=5, window="5m"):
             return None
 
         price_then = _resolve_binance_reference_close(candles, window=window)
-        window_open = _resolve_binance_window_open(candles, window=window)
-        if price_then is None or window_open is None:
+        rolling_reference_close = _resolve_binance_rolling_reference_close(candles, window=window)
+        if price_then is None or rolling_reference_close is None:
             return None
 
         price_now = float(candles[-1][4])    # close of newest candle (latest trade on the active 1m candle)
         anchor_momentum_pct = ((price_now - price_then) / price_then) * 100
-        window_momentum_pct = ((price_now - window_open) / window_open) * 100
+        window_momentum_pct = ((price_now - rolling_reference_close) / rolling_reference_close) * 100
         anchor_direction = _direction_from_change(anchor_momentum_pct)
         window_direction = _direction_from_change(window_momentum_pct)
         momentum_consistent = (
@@ -925,7 +934,7 @@ def get_binance_momentum(symbol="BTCUSDT", lookback_minutes=5, window="5m"):
             "direction": direction,
             "price_now": price_now,
             "price_then": price_then,
-            "window_open": window_open,
+            "rolling_reference_close": rolling_reference_close,
             "anchor_momentum_pct": anchor_momentum_pct,
             "window_momentum_pct": window_momentum_pct,
             "anchor_direction": anchor_direction,
