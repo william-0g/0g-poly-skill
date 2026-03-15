@@ -499,6 +499,9 @@ def compute_heuristic_signal(
     }
 
     if raw_direction not in {"up", "down"}:
+        if momentum.get("momentum_consistent") is False:
+            result["reason"] = "momentum-disagreement"
+            return result
         result["reason"] = "invalid-direction"
         return result
 

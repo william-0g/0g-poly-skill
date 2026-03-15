@@ -570,7 +570,7 @@ def get_clob_client():
             print("Error: FUNDER_ADDRESS environment variable not set")
             print("Set it when WALLET_TYPE is not 0")
             sys.exit(1)
-        client = ClobClient(CLOB_HOST, key=pk, signature_type=1, funder=funder_address, chain_id=POLYGON)
+        client = ClobClient(CLOB_HOST, key=pk, signature_type=wallet_type, funder=funder_address, chain_id=POLYGON)
     
     client.set_api_creds(client.create_or_derive_api_creds())
     return client
@@ -622,6 +622,18 @@ def _bucket_start(now, window):
         seconds=now.second,
         microseconds=now.microsecond,
     )
+
+
+def _window_minutes(window):
+    return 15 if window == "15m" else 5
+
+
+def _direction_from_change(change_pct):
+    if change_pct > 0:
+        return "up"
+    if change_pct < 0:
+        return "down"
+    return "neutral"
 
 
 def expected_fast_market_slug(asset="BTC", window="5m", now=None):
@@ -812,13 +824,62 @@ def _parse_fast_market_interval(question):
 # CEX Price Signal
 # =============================================================================
 
-def get_binance_momentum(symbol="BTCUSDT", lookback_minutes=5):
+def _resolve_binance_reference_close(candles, *, window, now=None):
+    """Use the last closed 1m candle before the current market bucket as the anchor price."""
+    now = now or datetime.now(timezone.utc)
+    current_bucket_start = _bucket_start(now, window)
+    reference_open_ts_ms = int((current_bucket_start - timedelta(minutes=1)).timestamp() * 1000)
+
+    reference_candle = None
+    for candle in candles:
+        try:
+            open_time_ms = int(candle[0])
+        except (TypeError, ValueError, IndexError):
+            continue
+        if open_time_ms == reference_open_ts_ms:
+            reference_candle = candle
+            break
+        if open_time_ms < int(current_bucket_start.timestamp() * 1000):
+            reference_candle = candle
+
+    if reference_candle is None:
+        return None
+
+    try:
+        return float(reference_candle[4])
+    except (TypeError, ValueError, IndexError):
+        return None
+
+
+def _resolve_binance_window_open(candles, *, window, now=None):
+    """Use the first 1m candle open inside the current market bucket."""
+    now = now or datetime.now(timezone.utc)
+    current_bucket_start = _bucket_start(now, window)
+    bucket_start_ts_ms = int(current_bucket_start.timestamp() * 1000)
+    next_bucket_ts_ms = int((current_bucket_start + timedelta(minutes=_window_minutes(window))).timestamp() * 1000)
+
+    for candle in candles:
+        try:
+            open_time_ms = int(candle[0])
+        except (TypeError, ValueError, IndexError):
+            continue
+        if bucket_start_ts_ms <= open_time_ms < next_bucket_ts_ms:
+            try:
+                return float(candle[1])
+            except (TypeError, ValueError, IndexError):
+                return None
+    return None
+
+
+def get_binance_momentum(symbol="BTCUSDT", lookback_minutes=5, window="5m"):
     """Get price momentum from Binance public API.
     Returns: {momentum_pct, direction, price_now, price_then, avg_volume, candles}
     """
+    window_minutes = _window_minutes(window)
+    limit = max(lookback_minutes, window_minutes + 1, (window_minutes * 2) + 1)
     url = (
         f"https://api.binance.com/api/v3/klines"
-        f"?symbol={symbol}&interval=1m&limit={lookback_minutes}"
+        f"?symbol={symbol}&interval=1m&limit={limit}"
     )
     result = _api_request(url)
     if not result or isinstance(result, dict):
@@ -830,10 +891,27 @@ def get_binance_momentum(symbol="BTCUSDT", lookback_minutes=5):
         if len(candles) < 2:
             return None
 
-        price_then = float(candles[0][1])   # open of oldest candle
-        price_now = float(candles[-1][4])    # close of newest candle
-        momentum_pct = ((price_now - price_then) / price_then) * 100
-        direction = "up" if momentum_pct > 0 else "down"
+        price_then = _resolve_binance_reference_close(candles, window=window)
+        window_open = _resolve_binance_window_open(candles, window=window)
+        if price_then is None or window_open is None:
+            return None
+
+        price_now = float(candles[-1][4])    # close of newest candle (latest trade on the active 1m candle)
+        anchor_momentum_pct = ((price_now - price_then) / price_then) * 100
+        window_momentum_pct = ((price_now - window_open) / window_open) * 100
+        anchor_direction = _direction_from_change(anchor_momentum_pct)
+        window_direction = _direction_from_change(window_momentum_pct)
+        momentum_consistent = (
+            anchor_direction in {"up", "down"}
+            and anchor_direction == window_direction
+        )
+        momentum_pct = (
+            min(abs(anchor_momentum_pct), abs(window_momentum_pct))
+            * (1 if anchor_direction == "up" else -1)
+            if momentum_consistent
+            else 0.0
+        )
+        direction = anchor_direction if momentum_consistent else "neutral"
 
         volumes = [float(c[5]) for c in candles]
         avg_volume = sum(volumes) / len(volumes)
@@ -847,10 +925,17 @@ def get_binance_momentum(symbol="BTCUSDT", lookback_minutes=5):
             "direction": direction,
             "price_now": price_now,
             "price_then": price_then,
+            "window_open": window_open,
+            "anchor_momentum_pct": anchor_momentum_pct,
+            "window_momentum_pct": window_momentum_pct,
+            "anchor_direction": anchor_direction,
+            "window_direction": window_direction,
+            "momentum_consistent": momentum_consistent,
             "avg_volume": avg_volume,
             "latest_volume": latest_volume,
             "volume_ratio": volume_ratio,
             "candles": len(candles),
+            "reference_window": window,
             "ohlcv": [
                 [
                     float(c[1]),
@@ -897,7 +982,7 @@ def get_momentum(asset="BTC", source="binance", lookback=5):
     """Get price momentum from configured source."""
     if source == "binance":
         symbol = ASSET_SYMBOLS.get(asset, "BTCUSDT")
-        return get_binance_momentum(symbol, lookback)
+        return get_binance_momentum(symbol, lookback, WINDOW)
     elif source == "coingecko":
         cg_id = COINGECKO_ASSETS.get(asset, "bitcoin")
         return get_coingecko_momentum(cg_id, lookback)
@@ -2096,6 +2181,14 @@ def run_fast_market_strategy(
     log(f"  Price: ${momentum['price_now']:,.2f} (was ${momentum['price_then']:,.2f})")
     log(f"  Momentum: {momentum['momentum_pct']:+.3f}%")
     log(f"  Direction: {momentum['direction']}")
+    if momentum.get("anchor_momentum_pct") is not None and momentum.get("window_momentum_pct") is not None:
+        log(
+            "  Momentum detail: "
+            f"anchor {momentum['anchor_momentum_pct']:+.3f}% "
+            f"({momentum.get('anchor_direction')}) | "
+            f"window {momentum['window_momentum_pct']:+.3f}% "
+            f"({momentum.get('window_direction')})"
+        )
     if VOLUME_CONFIDENCE:
         log(f"  Volume ratio: {momentum['volume_ratio']:.2f}x avg")
 
