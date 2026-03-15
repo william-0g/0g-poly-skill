@@ -37,6 +37,7 @@ except ImportError:
     )
 
 FACTOR_DIM = 10
+FEATURE_SCHEMA_VERSION = 2
 
 
 def _ensure_sequence_tensor(
@@ -132,6 +133,7 @@ class QuantModel(nn.Module):
         self.dropout = dropout
         self.factor_dim = FACTOR_DIM
         self.input_dim = 5 + order_book_dim + 1 + self.factor_dim
+        self.feature_schema_version = FEATURE_SCHEMA_VERSION
 
         self.register_buffer("feature_mean", torch.zeros(self.input_dim))
         self.register_buffer("feature_std", torch.ones(self.input_dim))
@@ -221,6 +223,7 @@ class QuantModel(nn.Module):
         microprice = (
             best_ask * bid_depth + best_bid * ask_depth
         ) / total_depth
+        first_poly_price = poly_price[:, :1].clamp_min(eps)
         one_step_return = (close - prev_close) / prev_close.clamp_min(eps)
         range_pct = (high - low) / close.clamp_min(eps)
         first_close = close[:, :1].clamp_min(eps)
@@ -245,6 +248,29 @@ class QuantModel(nn.Module):
         vwap_gap = (close - vwap) / vwap.clamp_min(eps)
         price_vs_microprice = (poly_price - microprice) / mid
 
+        transformed_ohlcv = torch.stack(
+            (
+                (open_ - prev_close) / prev_close.clamp_min(eps),
+                (high - prev_close) / prev_close.clamp_min(eps),
+                (low - prev_close) / prev_close.clamp_min(eps),
+                one_step_return,
+                torch.log1p(volume.clamp_min(0.0)),
+            ),
+            dim=-1,
+        )
+        transformed_order_book = torch.stack(
+            (
+                (best_bid - mid) / mid,
+                (best_ask - mid) / mid,
+                spread_pct,
+                torch.log1p(bid_depth.clamp_min(0.0)),
+                torch.log1p(ask_depth.clamp_min(0.0)),
+                imbalance,
+            ),
+            dim=-1,
+        )
+        transformed_price = ((poly_price - first_poly_price) / first_poly_price).unsqueeze(-1)
+
         factors = torch.stack(
             (
                 cumulative_return,
@@ -261,7 +287,7 @@ class QuantModel(nn.Module):
             dim=-1,
         )
 
-        combined = torch.cat((ohlcv_tensor, order_book_tensor, price_tensor, factors), dim=-1)
+        combined = torch.cat((transformed_ohlcv, transformed_order_book, transformed_price, factors), dim=-1)
         return combined
 
     def prepare_features(
@@ -413,6 +439,13 @@ def load_quant_model(
     checkpoint = torch.load(checkpoint_path, map_location=map_location)
     if not isinstance(checkpoint, dict) or "model_state_dict" not in checkpoint:
         raise ValueError("Checkpoint must contain model_state_dict")
+    checkpoint_schema_version = int(checkpoint.get("feature_schema_version", 1) or 1)
+    if checkpoint_schema_version != FEATURE_SCHEMA_VERSION:
+        raise ValueError(
+            "Checkpoint feature schema mismatch: "
+            f"expected v{FEATURE_SCHEMA_VERSION}, got v{checkpoint_schema_version}. "
+            "Retrain the model with the current quant_model.py."
+        )
 
     model_kwargs = checkpoint.get("model_kwargs", {})
     model = build_quant_model(**model_kwargs)

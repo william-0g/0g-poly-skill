@@ -1,0 +1,121 @@
+{
+  "best_epoch": 3,
+  "device": "cpu",
+  "train": {
+    "loss": 0.5938694477081299,
+    "accuracy": 0.6359649300575256,
+    "weighted_accuracy": 0.6912359595298767,
+    "positive_rate": 0.5043859481811523,
+    "mean_confidence": 0.2662433385848999,
+    "count": 912
+  },
+  "val": {
+    "loss": 0.6910679340362549,
+    "accuracy": 0.5255101919174194,
+    "weighted_accuracy": 0.5447694659233093,
+    "positive_rate": 0.48469388484954834,
+    "mean_confidence": 0.18713989853858948,
+    "count": 196
+  },
+  "test": {
+    "loss": 0.59406977891922,
+    "accuracy": 0.6122449040412903,
+    "weighted_accuracy": 0.6742600798606873,
+    "positive_rate": 0.4642857015132904,
+    "mean_confidence": 0.24532000720500946,
+    "count": 196
+  },
+  "dataset": {
+    "total": 1304,
+    "train": 912,
+    "val": 196,
+    "test": 196,
+    "reference_symbol": "ETH-USD",
+    "reference_path": "data/reference/coinbase_eth_usd_1m.csv",
+    "label_positive_rate": 0.495398773006135,
+    "start_price_mean": 2006.0292868098163,
+    "end_price_mean": 2006.034309815951
+  },
+  "augmentation": {
+    "probability": 0.0,
+    "price_noise_std": 0.01,
+    "spread_noise_std": 0.08,
+    "depth_noise_std": 0.15,
+    "volume_noise_std": 0.12,
+    "imbalance_noise_std": 0.05
+  },
+  "history": [
+    {
+      "epoch": 1,
+      "train_loss": 0.6760261947648567,
+      "train_accuracy": 0.6041666865348816,
+      "val_loss": 0.6990489363670349,
+      "val_accuracy": 0.4897959232330322,
+      "val_weighted_accuracy": 0.5209763050079346
+    },
+    {
+      "epoch": 2,
+      "train_loss": 0.6388311940327025,
+      "train_accuracy": 0.6228070259094238,
+      "val_loss": 0.6993891000747681,
+      "val_accuracy": 0.5204081535339355,
+      "val_weighted_accuracy": 0.5357363820075989
+    },
+    {
+      "epoch": 3,
+      "train_loss": 0.6174215224751255,
+      "train_accuracy": 0.6359649300575256,
+      "val_loss": 0.6910679340362549,
+      "val_accuracy": 0.5255101919174194,
+      "val_weighted_accuracy": 0.5447694659233093
+    },
+    {
+      "epoch": 4,
+      "train_loss": 0.596525019720981,
+      "train_accuracy": 0.6491228342056274,
+      "val_loss": 0.7053921818733215,
+      "val_accuracy": 0.545918345451355,
+      "val_weighted_accuracy": 0.5729109644889832
+    },
+    {
+      "epoch": 5,
+      "train_loss": 0.573035454540922,
+      "train_accuracy": 0.6666666865348816,
+      "val_loss": 0.7059621810913086,
+      "val_accuracy": 0.5102040767669678,
+      "val_weighted_accuracy": 0.5417365431785583
+    },
+    {
+      "epoch": 6,
+      "train_loss": 0.5473261674245199,
+      "train_accuracy": 0.6699561476707458,
+      "val_loss": 0.7068451046943665,
+      "val_accuracy": 0.5255101919174194,
+      "val_weighted_accuracy": 0.5677233338356018
+    },
+    {
+      "epoch": 7,
+      "train_loss": 0.5220897657829419,
+      "train_accuracy": 0.6907894611358643,
+      "val_loss": 0.702984094619751,
+      "val_accuracy": 0.5408163070678711,
+      "val_weighted_accuracy": 0.5848885178565979
+    },
+    {
+      "epoch": 8,
+      "train_loss": 0.49944738756146345,
+      "train_accuracy": 0.6929824352264404,
+      "val_loss": 0.7103554010391235,
+      "val_accuracy": 0.5408163070678711,
+      "val_weighted_accuracy": 0.5860049724578857
+    },
+    {
+      "epoch": 9,
+      "train_loss": 0.49273876244561715,
+      "train_accuracy": 0.6995614171028137,
+      "val_loss": 0.7271169424057007,
+      "val_accuracy": 0.5510203838348389,
+      "val_weighted_accuracy": 0.591525137424469
+    }
+  ]
+}
